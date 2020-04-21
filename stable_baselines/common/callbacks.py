@@ -201,6 +201,36 @@ class CheckpointCallback(BaseCallback):
                 print("Saving model checkpoint to {}".format(path))
         return True
 
+class TFCheckpointCallback(BaseCallback):
+    """
+    Callback for saving a model every `save_freq` steps
+
+    :param save_freq: (int)
+    :param save_path: (str) Path to the folder where the model will be saved.
+    :param name_prefix: (str) Common prefix to the saved models
+    """
+    def __init__(self, save_freq: int, save_path: str, name_prefix='rl_model', verbose=0):
+        super(CheckpointCallback, self).__init__(verbose)
+        self.save_freq = save_freq
+        self.save_path = save_path
+        self.name_prefix = name_prefix
+
+        self.saver = tf.train.Saver()
+
+    def _init_callback(self) -> None:
+        # Create folder if needed
+        if self.save_path is not None:
+            os.makedirs(self.save_path, exist_ok=True)
+
+    def _on_step(self) -> bool:
+
+        if self.n_calls % self.save_freq == 0:
+            path = os.path.join(self.save_path, '{}_{}_steps.ckpt'.format(self.name_prefix, self.num_timesteps))
+            self.saver.save(self.model.sess, 'path')
+            if self.verbose > 1:
+                print("Saving model checkpoint to {}".format(path))
+        return True
+
 
 class ConvertCallback(BaseCallback):
     """
