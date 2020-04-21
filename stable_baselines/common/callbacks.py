@@ -210,7 +210,7 @@ class TFCheckpointCallback(BaseCallback):
     :param name_prefix: (str) Common prefix to the saved models
     """
     def __init__(self, save_freq: int, save_path: str, name_prefix='rl_model', verbose=0):
-        super(CheckpointCallback, self).__init__(verbose)
+        super(TFCheckpointCallback, self).__init__(verbose)
         self.save_freq = save_freq
         self.save_path = save_path
         self.name_prefix = name_prefix
