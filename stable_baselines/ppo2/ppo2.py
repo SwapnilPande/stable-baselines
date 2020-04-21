@@ -52,7 +52,8 @@ class PPO2(ActorCriticRLModel):
     def __init__(self, policy, env, gamma=0.99, n_steps=128, ent_coef=0.01, learning_rate=2.5e-4, vf_coef=0.5,
                  max_grad_norm=0.5, lam=0.95, nminibatches=4, noptepochs=4, cliprange=0.2, cliprange_vf=None,
                  verbose=0, tensorboard_log=None, _init_setup_model=True, policy_kwargs=None,
-                 full_tensorboard_log=False, seed=None, n_cpu_tf_sess=None, enable_fake_quantization = False):
+                 full_tensorboard_log=False, seed=None, n_cpu_tf_sess=None, enable_fake_quantization = False,
+                 eval_only = False, tf_checkpoint_path = None):
 
         self.learning_rate = learning_rate
         self.cliprange = cliprange
@@ -67,6 +68,11 @@ class PPO2(ActorCriticRLModel):
         self.noptepochs = noptepochs
         self.tensorboard_log = tensorboard_log
         self.full_tensorboard_log = full_tensorboard_log
+
+
+        self.eval_only = eval_only
+        self.tf_checkpoint_path = tf_checkpoint_path
+        self.enable_fake_quantization = enable_fake_quantization
 
         self.action_ph = None
         self.advs_ph = None
@@ -95,11 +101,6 @@ class PPO2(ActorCriticRLModel):
         if _init_setup_model:
             self.setup_model()
 
-        # Update the training graph in place to include fake quantization layers so that the model can be ported to an edge TPU
-        if enable_fake_quantization:
-            print("INFO: Enabling Fake Quantization")
-            g = tf.get_default_graph()
-            tf.contrib.quantize.create_training_graph(input_graph=g)
 
     def _make_runner(self):
         return Runner(env=self.env, model=self, n_steps=self.n_steps,
@@ -121,6 +122,7 @@ class PPO2(ActorCriticRLModel):
 
             self.graph = tf.Graph()
             with self.graph.as_default():
+
                 self.set_random_seed(self.seed)
                 self.sess = tf_util.make_session(num_cpu=self.n_cpu_tf_sess, graph=self.graph)
 
@@ -140,102 +142,115 @@ class PPO2(ActorCriticRLModel):
                                               self.n_envs // self.nminibatches, self.n_steps, n_batch_train,
                                               reuse=True, **self.policy_kwargs)
 
-                with tf.variable_scope("loss", reuse=False):
-                    self.action_ph = train_model.pdtype.sample_placeholder([None], name="action_ph")
-                    self.advs_ph = tf.placeholder(tf.float32, [None], name="advs_ph")
-                    self.rewards_ph = tf.placeholder(tf.float32, [None], name="rewards_ph")
-                    self.old_neglog_pac_ph = tf.placeholder(tf.float32, [None], name="old_neglog_pac_ph")
-                    self.old_vpred_ph = tf.placeholder(tf.float32, [None], name="old_vpred_ph")
-                    self.learning_rate_ph = tf.placeholder(tf.float32, [], name="learning_rate_ph")
-                    self.clip_range_ph = tf.placeholder(tf.float32, [], name="clip_range_ph")
+                                                      # Update the training graph in place to include fake quantization layers so that the model can be ported to an edge TPU
+        if enable_fake_quantization:
+            print("INFO: Enabling Fake Quantization")
+            g = tf.get_default_graph()
+            print(g.get_operations())
 
-                    neglogpac = train_model.proba_distribution.neglogp(self.action_ph)
-                    self.entropy = tf.reduce_mean(train_model.proba_distribution.entropy())
+                if not self.eval_only:
+                    if self.enable_fake_quantization:
+                        tf.contrib.quantize.create_training_graph(input_graph=g)
 
-                    vpred = train_model.value_flat
+                    with tf.variable_scope("loss", reuse=False):
+                        self.action_ph = train_model.pdtype.sample_placeholder([None], name="action_ph")
+                        self.advs_ph = tf.placeholder(tf.float32, [None], name="advs_ph")
+                        self.rewards_ph = tf.placeholder(tf.float32, [None], name="rewards_ph")
+                        self.old_neglog_pac_ph = tf.placeholder(tf.float32, [None], name="old_neglog_pac_ph")
+                        self.old_vpred_ph = tf.placeholder(tf.float32, [None], name="old_vpred_ph")
+                        self.learning_rate_ph = tf.placeholder(tf.float32, [], name="learning_rate_ph")
+                        self.clip_range_ph = tf.placeholder(tf.float32, [], name="clip_range_ph")
 
-                    # Value function clipping: not present in the original PPO
-                    if self.cliprange_vf is None:
-                        # Default behavior (legacy from OpenAI baselines):
-                        # use the same clipping as for the policy
-                        self.clip_range_vf_ph = self.clip_range_ph
-                        self.cliprange_vf = self.cliprange
-                    elif isinstance(self.cliprange_vf, (float, int)) and self.cliprange_vf < 0:
-                        # Original PPO implementation: no value function clipping
-                        self.clip_range_vf_ph = None
-                    else:
-                        # Last possible behavior: clipping range
-                        # specific to the value function
-                        self.clip_range_vf_ph = tf.placeholder(tf.float32, [], name="clip_range_vf_ph")
+                        neglogpac = train_model.proba_distribution.neglogp(self.action_ph)
+                        self.entropy = tf.reduce_mean(train_model.proba_distribution.entropy())
 
-                    if self.clip_range_vf_ph is None:
-                        # No clipping
-                        vpred_clipped = train_model.value_flat
-                    else:
-                        # Clip the different between old and new value
-                        # NOTE: this depends on the reward scaling
-                        vpred_clipped = self.old_vpred_ph + \
-                            tf.clip_by_value(train_model.value_flat - self.old_vpred_ph,
-                                             - self.clip_range_vf_ph, self.clip_range_vf_ph)
+                        vpred = train_model.value_flat
 
-
-                    vf_losses1 = tf.square(vpred - self.rewards_ph)
-                    vf_losses2 = tf.square(vpred_clipped - self.rewards_ph)
-                    self.vf_loss = .5 * tf.reduce_mean(tf.maximum(vf_losses1, vf_losses2))
-
-                    ratio = tf.exp(self.old_neglog_pac_ph - neglogpac)
-                    pg_losses = -self.advs_ph * ratio
-                    pg_losses2 = -self.advs_ph * tf.clip_by_value(ratio, 1.0 - self.clip_range_ph, 1.0 +
-                                                                  self.clip_range_ph)
-                    self.pg_loss = tf.reduce_mean(tf.maximum(pg_losses, pg_losses2))
-                    self.approxkl = .5 * tf.reduce_mean(tf.square(neglogpac - self.old_neglog_pac_ph))
-                    self.clipfrac = tf.reduce_mean(tf.cast(tf.greater(tf.abs(ratio - 1.0),
-                                                                      self.clip_range_ph), tf.float32))
-                    loss = self.pg_loss - self.entropy * self.ent_coef + self.vf_loss * self.vf_coef
-
-                    tf.summary.scalar('entropy_loss', self.entropy)
-                    tf.summary.scalar('policy_gradient_loss', self.pg_loss)
-                    tf.summary.scalar('value_function_loss', self.vf_loss)
-                    tf.summary.scalar('approximate_kullback-leibler', self.approxkl)
-                    tf.summary.scalar('clip_factor', self.clipfrac)
-                    tf.summary.scalar('loss', loss)
-
-                    with tf.variable_scope('model'):
-                        self.params = tf.trainable_variables()
-                        if self.full_tensorboard_log:
-                            for var in self.params:
-                                tf.summary.histogram(var.name, var)
-                    grads = tf.gradients(loss, self.params)
-                    if self.max_grad_norm is not None:
-                        grads, _grad_norm = tf.clip_by_global_norm(grads, self.max_grad_norm)
-                    grads = list(zip(grads, self.params))
-                trainer = tf.train.AdamOptimizer(learning_rate=self.learning_rate_ph, epsilon=1e-5)
-                self._train = trainer.apply_gradients(grads)
-
-                self.loss_names = ['policy_loss', 'value_loss', 'policy_entropy', 'approxkl', 'clipfrac']
-
-                with tf.variable_scope("input_info", reuse=False):
-                    tf.summary.scalar('discounted_rewards', tf.reduce_mean(self.rewards_ph))
-                    tf.summary.scalar('learning_rate', tf.reduce_mean(self.learning_rate_ph))
-                    tf.summary.scalar('advantage', tf.reduce_mean(self.advs_ph))
-                    tf.summary.scalar('clip_range', tf.reduce_mean(self.clip_range_ph))
-                    if self.clip_range_vf_ph is not None:
-                        tf.summary.scalar('clip_range_vf', tf.reduce_mean(self.clip_range_vf_ph))
-
-                    tf.summary.scalar('old_neglog_action_probability', tf.reduce_mean(self.old_neglog_pac_ph))
-                    tf.summary.scalar('old_value_pred', tf.reduce_mean(self.old_vpred_ph))
-
-                    if self.full_tensorboard_log:
-                        tf.summary.histogram('discounted_rewards', self.rewards_ph)
-                        tf.summary.histogram('learning_rate', self.learning_rate_ph)
-                        tf.summary.histogram('advantage', self.advs_ph)
-                        tf.summary.histogram('clip_range', self.clip_range_ph)
-                        tf.summary.histogram('old_neglog_action_probability', self.old_neglog_pac_ph)
-                        tf.summary.histogram('old_value_pred', self.old_vpred_ph)
-                        if tf_util.is_image(self.observation_space):
-                            tf.summary.image('observation', train_model.obs_ph)
+                        # Value function clipping: not present in the original PPO
+                        if self.cliprange_vf is None:
+                            # Default behavior (legacy from OpenAI baselines):
+                            # use the same clipping as for the policy
+                            self.clip_range_vf_ph = self.clip_range_ph
+                            self.cliprange_vf = self.cliprange
+                        elif isinstance(self.cliprange_vf, (float, int)) and self.cliprange_vf < 0:
+                            # Original PPO implementation: no value function clipping
+                            self.clip_range_vf_ph = None
                         else:
-                            tf.summary.histogram('observation', train_model.obs_ph)
+                            # Last possible behavior: clipping range
+                            # specific to the value function
+                            self.clip_range_vf_ph = tf.placeholder(tf.float32, [], name="clip_range_vf_ph")
+
+                        if self.clip_range_vf_ph is None:
+                            # No clipping
+                            vpred_clipped = train_model.value_flat
+                        else:
+                            # Clip the different between old and new value
+                            # NOTE: this depends on the reward scaling
+                            vpred_clipped = self.old_vpred_ph + \
+                                tf.clip_by_value(train_model.value_flat - self.old_vpred_ph,
+                                                - self.clip_range_vf_ph, self.clip_range_vf_ph)
+
+
+                        vf_losses1 = tf.square(vpred - self.rewards_ph)
+                        vf_losses2 = tf.square(vpred_clipped - self.rewards_ph)
+                        self.vf_loss = .5 * tf.reduce_mean(tf.maximum(vf_losses1, vf_losses2))
+
+                        ratio = tf.exp(self.old_neglog_pac_ph - neglogpac)
+                        pg_losses = -self.advs_ph * ratio
+                        pg_losses2 = -self.advs_ph * tf.clip_by_value(ratio, 1.0 - self.clip_range_ph, 1.0 +
+                                                                    self.clip_range_ph)
+                        self.pg_loss = tf.reduce_mean(tf.maximum(pg_losses, pg_losses2))
+                        self.approxkl = .5 * tf.reduce_mean(tf.square(neglogpac - self.old_neglog_pac_ph))
+                        self.clipfrac = tf.reduce_mean(tf.cast(tf.greater(tf.abs(ratio - 1.0),
+                                                                        self.clip_range_ph), tf.float32))
+                        loss = self.pg_loss - self.entropy * self.ent_coef + self.vf_loss * self.vf_coef
+
+                        tf.summary.scalar('entropy_loss', self.entropy)
+                        tf.summary.scalar('policy_gradient_loss', self.pg_loss)
+                        tf.summary.scalar('value_function_loss', self.vf_loss)
+                        tf.summary.scalar('approximate_kullback-leibler', self.approxkl)
+                        tf.summary.scalar('clip_factor', self.clipfrac)
+                        tf.summary.scalar('loss', loss)
+
+                        with tf.variable_scope('model'):
+                            self.params = tf.trainable_variables()
+                            if self.full_tensorboard_log:
+                                for var in self.params:
+                                    tf.summary.histogram(var.name, var)
+                        grads = tf.gradients(loss, self.params)
+                        if self.max_grad_norm is not None:
+                            grads, _grad_norm = tf.clip_by_global_norm(grads, self.max_grad_norm)
+                        grads = list(zip(grads, self.params))
+                    trainer = tf.train.AdamOptimizer(learning_rate=self.learning_rate_ph, epsilon=1e-5)
+                    self._train = trainer.apply_gradients(grads)
+
+                    self.loss_names = ['policy_loss', 'value_loss', 'policy_entropy', 'approxkl', 'clipfrac']
+
+                    with tf.variable_scope("input_info", reuse=False):
+                        tf.summary.scalar('discounted_rewards', tf.reduce_mean(self.rewards_ph))
+                        tf.summary.scalar('learning_rate', tf.reduce_mean(self.learning_rate_ph))
+                        tf.summary.scalar('advantage', tf.reduce_mean(self.advs_ph))
+                        tf.summary.scalar('clip_range', tf.reduce_mean(self.clip_range_ph))
+                        if self.clip_range_vf_ph is not None:
+                            tf.summary.scalar('clip_range_vf', tf.reduce_mean(self.clip_range_vf_ph))
+
+                        tf.summary.scalar('old_neglog_action_probability', tf.reduce_mean(self.old_neglog_pac_ph))
+                        tf.summary.scalar('old_value_pred', tf.reduce_mean(self.old_vpred_ph))
+
+                        if self.full_tensorboard_log:
+                            tf.summary.histogram('discounted_rewards', self.rewards_ph)
+                            tf.summary.histogram('learning_rate', self.learning_rate_ph)
+                            tf.summary.histogram('advantage', self.advs_ph)
+                            tf.summary.histogram('clip_range', self.clip_range_ph)
+                            tf.summary.histogram('old_neglog_action_probability', self.old_neglog_pac_ph)
+                            tf.summary.histogram('old_value_pred', self.old_vpred_ph)
+                            if tf_util.is_image(self.observation_space):
+                                tf.summary.image('observation', train_model.obs_ph)
+                            else:
+                                tf.summary.histogram('observation', train_model.obs_ph)
+                else:
+                    if self.enable_fake_quantization:
+                        tf.contrib.quantize.create_eval_graph(input_graph=self.graph)
 
                 self.train_model = train_model
                 self.act_model = act_model
@@ -243,9 +258,16 @@ class PPO2(ActorCriticRLModel):
                 self.proba_step = act_model.proba_step
                 self.value = act_model.value
                 self.initial_state = act_model.initial_state
-                tf.global_variables_initializer().run(session=self.sess)  # pylint: disable=E1101
+
+                self.saver = tf.train.Saver()
+                if self.tf_checkpoint_path is None:
+                    tf.global_variables_initializer().run(session=self.sess)  # pylint: disable=E1101
+                else:
+                    self.saver.restore(self.sess, tf.train.latest_checkpoint(self.tf_checkpoint_path))
+
 
                 self.summary = tf.summary.merge_all()
+
 
     def _train_step(self, learning_rate, cliprange, obs, returns, masks, actions, values, neglogpacs, update,
                     writer, states=None, cliprange_vf=None):
