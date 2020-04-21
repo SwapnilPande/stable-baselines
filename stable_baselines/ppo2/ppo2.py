@@ -140,13 +140,7 @@ class PPO2(ActorCriticRLModel):
                                        custom_getter=tf_util.outer_scope_getter("train_model")):
                     train_model = self.policy(self.sess, self.observation_space, self.action_space,
                                               self.n_envs // self.nminibatches, self.n_steps, n_batch_train,
-                                              reuse=True, **self.policy_kwargs)
-
-                                                      # Update the training graph in place to include fake quantization layers so that the model can be ported to an edge TPU
-        if enable_fake_quantization:
-            print("INFO: Enabling Fake Quantization")
-            g = tf.get_default_graph()
-            print(g.get_operations())
+                                              reuse=True, **self.policy_kwargs)                              # Update the training graph in place to include fake quantization layers so that the model can be ported to an edge TPU
 
                 if not self.eval_only:
                     if self.enable_fake_quantization:
@@ -248,7 +242,7 @@ class PPO2(ActorCriticRLModel):
                                 tf.summary.image('observation', train_model.obs_ph)
                             else:
                                 tf.summary.histogram('observation', train_model.obs_ph)
-                else:
+                elif self.enable_fake_quantization:
                     if self.enable_fake_quantization:
                         tf.contrib.quantize.create_eval_graph(input_graph=self.graph)
 
